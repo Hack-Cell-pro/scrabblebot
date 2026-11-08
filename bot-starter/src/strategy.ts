@@ -158,13 +158,23 @@ export function decideBid(ctx: BidContext): number {
   const P = { ...DEFAULT_PARAMS, ...ctx.params };
   let marginal: number;
   let deny = 0;
+  let completes7 = false;
   if (ctx.dictionary?.length) {
     const ix = index(ctx.dictionary);
     const rack = toArr(ctx.myRack);
     const p = acquireP(bag, players);
-    const before = scan(ix, rack, p).potential;
-    const after = scan(ix, rack, p, letter.charCodeAt(0) - 65).potential;
+    const pre = scan(ix, rack, p);
+    const post = scan(ix, rack, p, letter.charCodeAt(0) - 65);
+    const before = pre.potential;
+    const after = post.potential;
     marginal = Math.max(0, after - before);
+    // The tile completes a 7+ letter word (max multiplier) that beats the
+    // best word playable now, and no 7+ word is playable without it.
+    completes7 =
+      post.bestNow >= 0 &&
+      ix.len[post.bestNow] >= 7 &&
+      post.bestNowR > pre.bestNowR &&
+      (pre.bestNow < 0 || ix.len[pre.bestNow] < 7);
     // Denial: a letter that would jump a contending rival's best word is worth
     // buying even if it only helps us a little (finishing place is what counts).
     const me = ctx.myScore ?? 0;
@@ -197,7 +207,7 @@ export function decideBid(ctx: BidContext): number {
     const f = letter === "Q" ? ((ctx.myRack.get("U") ?? 0) > 0 ? 5 : 0) : face;
     bid = Math.max(bid, P.FV * f);
   }
-  if (P.LC > 0 && face <= 2 && bag > 2) bid = Math.min(bid, P.LC);
+  if (P.LC > 0 && face <= 2 && bag > 2 && !completes7) bid = Math.min(bid, P.LC);
   if (bag <= 2) bid = balance; // last letters: money is worthless after this
   bid = Math.min(bid, balance);
 
