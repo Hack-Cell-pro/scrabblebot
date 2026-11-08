@@ -43,16 +43,18 @@ export interface Params {
   CASH: number;     // play-now threshold (fraction of waiting value)
   END: number;      // cash out everything when bag <= END (or players)
   FV: number;       // floor bid per face point for high-value letters (they score more per coin)
+  HV?: number;       // early floor bid per face point for J/X/Q/Z
   LC: number;       // cap on bids for 1-2 point letters (0 = no cap)
 }
 export const DEFAULT_PARAMS: Params = {
-  K: Number(process.env.BID_K ?? 2),
+  K: Number(process.env.BID_K ?? 3),
   PACE: Number(process.env.BID_PACE ?? 3),
   DENY: Number(process.env.BID_DENY ?? 0),
   CASH: Number(process.env.CASH ?? 2),
   END: Number(process.env.END ?? 3),
-  FV: Number(process.env.FV ?? 3),
+  FV: Number(process.env.FV ?? 4),
   LC: Number(process.env.LC ?? 12),
+  HV: Number(process.env.HV ?? 5.5),
 };
 
 export interface WordContext {
@@ -158,23 +160,13 @@ export function decideBid(ctx: BidContext): number {
   const P = { ...DEFAULT_PARAMS, ...ctx.params };
   let marginal: number;
   let deny = 0;
-  let completes7 = false;
   if (ctx.dictionary?.length) {
     const ix = index(ctx.dictionary);
     const rack = toArr(ctx.myRack);
     const p = acquireP(bag, players);
-    const pre = scan(ix, rack, p);
-    const post = scan(ix, rack, p, letter.charCodeAt(0) - 65);
-    const before = pre.potential;
-    const after = post.potential;
+    const before = scan(ix, rack, p).potential;
+    const after = scan(ix, rack, p, letter.charCodeAt(0) - 65).potential;
     marginal = Math.max(0, after - before);
-    // The tile completes a 7+ letter word (max multiplier) that beats the
-    // best word playable now, and no 7+ word is playable without it.
-    completes7 =
-      post.bestNow >= 0 &&
-      ix.len[post.bestNow] >= 7 &&
-      post.bestNowR > pre.bestNowR &&
-      (pre.bestNow < 0 || ix.len[pre.bestNow] < 7);
     // Denial: a letter that would jump a contending rival's best word is worth
     // buying even if it only helps us a little (finishing place is what counts).
     const me = ctx.myScore ?? 0;
@@ -206,8 +198,14 @@ export function decideBid(ctx: BidContext): number {
     // Q is hard to use; treat it like a 5-point letter, and only with a U in hand.
     const f = letter === "Q" ? ((ctx.myRack.get("U") ?? 0) > 0 ? 5 : 0) : face;
     bid = Math.max(bid, P.FV * f);
+    // Top bots win 8-10 point letters early (paying ~34-39); words with them earn
+    // ~40-49 vs ~27 average. Fight for them while there is time to build around them.
+    if (face >= 8 && bag > 30) {
+      const q = letter === "Q" ? ((ctx.myRack.get("U") ?? 0) > 0 ? 10 : 6) : face;
+      bid = Math.max(bid, (P.HV ?? 5.5) * q);
+    }
   }
-  if (P.LC > 0 && face <= 2 && bag > 2 && !completes7) bid = Math.min(bid, P.LC);
+  if (P.LC > 0 && face <= 2 && bag > 2) bid = Math.min(bid, P.LC);
   if (bag <= 2) bid = balance; // last letters: money is worthless after this
   bid = Math.min(bid, balance);
 
