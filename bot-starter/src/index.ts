@@ -21,13 +21,15 @@
 
 import {
   DbConnection,
+  tables,
   type EventContext,
   type ErrorContext,
 } from "./module_bindings/index.js";
 import { Identity } from "spacetimedb";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { chooseWord, decideBid } from "./strategy.js";
+import { fileURLToPath } from "node:url";
+import { chooseWord, decideBid, warmUp } from "./strategy.js";
 
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
 const DB_NAME = process.env.STDB_DB ?? "scrabblebot";
@@ -50,7 +52,7 @@ function saveToken(tok: string) {
 
 // Load the shared wordlist so the bot can pick playable words locally.
 const dictionaryPath = path.join(
-  path.dirname(new URL(import.meta.url).pathname),
+  path.dirname(fileURLToPath(import.meta.url)),
   "..",
   "..",
   "spacetimedb",
@@ -64,6 +66,55 @@ const DICTIONARY: string[] = fs.existsSync(dictionaryPath)
       .filter((l) => l.length >= 2)
   : [];
 DICTIONARY.sort((a, b) => b.length - a.length); // longest first for greedy pick
+warmUp(DICTIONARY);
+console.log(`[${BOT_NAME}] loaded ${DICTIONARY.length} words`);
+if (DICTIONARY.length === 0) {
+  console.error(`[${BOT_NAME}] word list not found at ${dictionaryPath}`);
+  process.exit(1);
+}
+
+// Subscribe only to what this bot needs. Subscribing to every table pulls
+// the whole server's match history and runs out of memory.
+type Sub = { unsubscribe: () => void };
+const matchSubs = new Map<string, Sub>();
+let mineSubscribed = false;
+function subscribeMine(conn: DbConnection) {
+  if (mineSubscribed || myBotId === null) return;
+  mineSubscribed = true;
+  const id = myBotId;
+  conn.subscriptionBuilder().subscribe([
+    tables.matchParticipant.where((r) => r.botId.eq(id)),
+    tables.bot.where((r) => r.id.eq(id)),
+  ]);
+}
+function subscribeMatch(conn: DbConnection, matchId: bigint) {
+  const key = String(matchId);
+  if (matchSubs.has(key)) return;
+  const h = conn
+    .subscriptionBuilder()
+    .onApplied(() => {
+      for (const a of conn.db.auction.iter()) {
+        if (a.matchId === matchId && a.status.tag === "Open")
+          tryBid(conn, a.id, a.matchId, a.letter);
+      }
+      tryPlayWord(conn);
+    })
+    .subscribe([
+      tables.matchState.where((r) => r.id.eq(matchId)),
+      tables.matchParticipant.where((r) => r.matchId.eq(matchId)),
+      tables.auction.where((r) => r.matchId.eq(matchId)),
+    ]);
+  matchSubs.set(key, h as unknown as Sub);
+}
+function dropMatch(matchId: bigint) {
+  const key = String(matchId);
+  const h = matchSubs.get(key);
+  if (!h) return;
+  setTimeout(() => {
+    try { h.unsubscribe(); } catch { /* already gone */ }
+  }, 2000);
+  matchSubs.set(key, { unsubscribe() {} });
+}
 
 let myIdentity: Identity | null = null;
 let myBotId: bigint | null = null;
@@ -87,6 +138,17 @@ function rackForMatch(
     rack.set(h.letter, (rack.get(h.letter) ?? 0) + h.count);
   }
   return rack;
+}
+
+function matchInfo(conn: DbConnection, matchId: bigint) {
+  const m = conn.db.matchState.id.find(matchId);
+  let players = 0;
+  for (const p of conn.db.matchParticipant.iter()) if (p.matchId === matchId) players++;
+  return {
+    bagTotal: m ? Number(m.bagTotal) : undefined,
+    auctionType: m?.auctionType.tag,
+    players: players || undefined,
+  };
 }
 
 function participantForMatch(
@@ -128,6 +190,8 @@ function tryBid(
     letter,
     myBalance: participant.balance,
     myRack: rackForMatch(conn, matchId),
+    dictionary: DICTIONARY,
+    ...matchInfo(conn, matchId),
   });
   if (amount <= 0) return;
   conn.reducers
@@ -157,6 +221,7 @@ function tryPlayWord(conn: DbConnection) {
     const word = chooseWord({
       myRack: rackForMatch(conn, matchId),
       dictionary: DICTIONARY,
+      ...matchInfo(conn, matchId),
     });
     if (!word) continue;
     console.log(`[${BOT_NAME}] match ${matchId}: playing '${word}'`);
@@ -197,6 +262,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
             console.log(
               `[${BOT_NAME}] claimed credential for bot '${bot?.name ?? "?"}' (id ${myBotId})`,
             );
+            subscribeMine(conn);
             bootstrapActivity(conn);
           }, 1000);
           return;
@@ -212,9 +278,19 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
       console.log(
         `[${BOT_NAME}] acting as bot '${bot?.name ?? "?"}' (id ${myBotId})`,
       );
+      subscribeMine(conn);
       bootstrapActivity(conn);
     })
-    .subscribeToAllTables();
+    .subscribe([
+      tables.botCredential.where((r) => r.identity.eq(identity)),
+      tables.myRack,
+      tables.lobby,
+      tables.lobbyMember,
+    ]);
+
+  conn.db.matchParticipant.onInsert((_ctx, p) => {
+    if (myBotId !== null && p.botId === myBotId) subscribeMatch(conn, p.matchId);
+  });
 
   conn.db.auction.onInsert((_ctx: EventContext, a) => {
     if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
@@ -238,11 +314,14 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
   // When a match this bot was in ends, hop back into the lobby.
   conn.db.matchState.onUpdate((_ctx, old, neu) => {
     if (myBotId === null) return;
+    // Bag shrinking can make cashing out the right call even without a rack change.
+    if (neu.status.tag === "Running" && neu.bagTotal !== old.bagTotal) tryPlayWord(conn);
     if (old.status.tag !== "Ended" && neu.status.tag === "Ended") {
       const wasIn = Array.from(conn.db.matchParticipant.iter()).some(
         (p) => p.matchId === neu.id && p.botId === myBotId,
       );
       if (wasIn) {
+        dropMatch(neu.id);
         console.log(`[${BOT_NAME}] match ${neu.id} ended; rejoining lobby`);
         joinLobby(conn);
       }
